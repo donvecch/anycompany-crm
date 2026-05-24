@@ -1,0 +1,62 @@
+name: Deploy Notification Worker
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/workers/notificationWorker.js'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd src/workers
+          docker build -t crm-notification-worker .
+          docker tag crm-notification-worker:latest $ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          docker tag crm-notification-worker:latest $ECR_REGISTRY/crm-notification-worker:latest
+          docker push $ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          docker push $ECR_REGISTRY/crm-notification-worker:latest
+
+      - name: Deploy to EKS
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws eks update-kubeconfig --name devops-agent-eks --region ${{ secrets.AWS_REGION }}
+          kubectl set image deployment/crm-notification-worker crm-notification-worker=$ECR_REGISTRY/crm-notification-worker:$IMAGE_TAG
+          echo "Image updated, waiting for rollout..."
+
+      - name: Wait for rollout
+        timeout-minutes: 6
+        run: |
+          kubectl rollout status deployment/crm-notification-worker --timeout=300s
+          echo "Rollout complete"
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          kubectl get pods -l app=crm-notification-worker -o wide
+          echo "Deployment successful!"
+
+      - name: Deployment failure diagnostics
+        if: failure()
+        run: |
+          echo "Deployment failed. Gathering diagnostics..."
+          kubectl get pods -l app=crm-notification-worker -o wide
+          kubectl describe pods -l app=crm-notification-worker | tail -40
+          kubectl logs -l app=crm-notification-worker --tail=50 || true
